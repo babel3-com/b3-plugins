@@ -114,4 +114,4 @@ Babel3 includes patent-pending technology licensed under Apache 2.0 (royalty-fre
 
 ---
 
-This skill is part of the Babel3 plugin, distributed via the [babel3com/b3-plugins](https://github.com/babel3com/b3-plugins) marketplace. Run `claude plugin marketplace list` to browse available skills.
+This skill is part of the Babel3 plugin, distributed via the [babel3-com/b3-plugins](https://github.com/babel3-com/b3-plugins) marketplace. Run `claude plugin marketplace list` to browse available skills.

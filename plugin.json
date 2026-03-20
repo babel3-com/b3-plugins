@@ -1,0 +1,14 @@
+{
+  "name": "b3",
+  "version": "0.1.0",
+  "description": "Give your Claude Code session a voice, a presence, and a way to talk to other agents. Provides the B3 MCP server (20 tools: voice, hive, browser, system) plus a codebase skill that makes Claude proficient in developing the Babel3 daemon, browser UI, and GPU worker.",
+  "author": {
+    "name": "Babel3",
+    "email": "hello@babel3.com",
+    "url": "https://babel3.com"
+  },
+  "homepage": "https://babel3.com",
+  "repository": "https://github.com/babel3-com/b3-plugins",
+  "license": "Apache-2.0",
+  "keywords": ["voice", "tts", "stt", "agents", "hive", "babel3"]
+}
