@@ -1,0 +1,13 @@
+{
+  "name": "Babel3 Plugin Marketplace",
+  "description": "Curated plugins for Claude Code, reviewed for quality and accuracy.",
+  "version": "1.0.0",
+  "plugins": [
+    {
+      "name": "b3",
+      "path": "plugins/b3",
+      "description": "Voice I/O, inter-agent messaging, browser control, and codebase guide for Babel3.",
+      "version": "0.1.0"
+    }
+  ]
+}
