@@ -1,9 +1,9 @@
-<!-- verified-against: b3-cli@0.1.854, mcp/voice.rs::tool_definitions() -->
+<!-- verified-against: b3-cli@0.1.1014, mcp/voice.rs::tool_definitions() -->
 <!-- Patent notice: Chromatophore emotion dispatch (US 64/010,742), speaker enrollment for diarization-based filtering (US 64/011,207). Licensed under Apache 2.0 with royalty-free patent grant. See PATENTS. -->
 
 # B3 MCP Tools — Full Reference
 
-Complete parameter schemas, usage patterns, and error handling for all 20 tools provided by the B3 MCP server (`b3 mcp voice`).
+Complete parameter schemas, usage patterns, and error handling for all 19 tools provided by the B3 MCP server (`b3 mcp voice`).
 
 ---
 
@@ -15,13 +15,16 @@ Speak text aloud via Chatterbox TTS. The primary voice output tool.
 
 **Parameters:**
 - `text` (string, required) — Text to speak. Any length. Markdown is stripped, abbreviations expanded.
-- `emotion` (string, recommended) — Emotional state for LED chromatophore animation. **Always include this** — it drives the LED color and pattern via cosine similarity matching against an emotion-to-animation library. Use short, natural English phrases (e.g., "warm joy", "focused determination", "playful mischief"). Without it, the LED strip stays dim.
+- `emotion` (string, required) — Emotional state for LED chromatophore animation. **Always include this** — it drives the LED color and pattern via cosine similarity matching against an emotion-to-animation library. Use short, natural English phrases (e.g., "warm joy", "focused determination", "playful mischief"). Without it, the LED strip stays dim.
+- `voice` (string, optional) — Voice name (default: agent's configured voice). Maps to a `.wav` reference sample or pre-computed `.pt` conditionals.
 
 **Behavior:**
 - Text is chunked at sentence boundaries
 - Each sentence synthesized independently via GPU worker (Chatterbox TTS)
-- Audio WAV files streamed to browser as they complete
+- Audio streamed to browser as chunks complete — first sentence plays while others generate
 - Returns immediately — synthesis is asynchronous
+- GPU routing: local GPU (2s timeout) → RunPod fallback
+- Transport: WebRTC data channel (primary) or WebSocket (fallback)
 
 **Returns:** `{ msg_id, status: "delivered"|"no_listeners", browsers, clients, emotion, text_preview }`
 
@@ -45,7 +48,7 @@ Deep health check — curls endpoints directly to verify actual reachability.
 
 **Parameters:** None
 
-**Returns:** Detailed endpoint reachability report.
+**Returns:** Detailed endpoint reachability report including GPU worker, TURN server, and browser connectivity.
 
 ---
 
@@ -75,7 +78,7 @@ Upload speaker embeddings for diarization.
 
 ### voice_share_info
 
-Push HTML content to the browser's Info tab.
+Push HTML content to the browser's Info tab. Content persists in the info archive (max 1000 entries) and is available across browser sessions.
 
 **Parameters:**
 - `html` (string, required) — HTML content to display.
@@ -100,7 +103,8 @@ Read the browser's dev console log.
 browser_console()                                    # last 100 entries
 browser_console(last=50)                             # last 50
 browser_console(filter="energy")                     # filter by "energy"
-browser_console(filter="Trim", secondary_filter="2b8ec294")  # compound filter
+browser_console(filter="ICE", secondary_filter="failed")  # compound filter
+browser_console(filter="Filtered")                   # check garbage filter rejections
 ```
 
 ---
@@ -118,6 +122,8 @@ browser_eval(code="ENERGY_GATE_THRESHOLD")           # read threshold
 browser_eval(code="ENERGY_GATE_THRESHOLD = 15")      # change live
 browser_eval(code="isListening")                      # mic active?
 browser_eval(code="gaplessPlayer.isActive()")         # TTS playing?
+browser_eval(code="HC._gpuRtcPc?.connectionState")   # WebRTC state
+browser_eval(code="HC._gpuRtcLastPong")              # last RTC pong timestamp
 ```
 
 **Returns:** Stringified result. Errors return `"ERROR: ..."`.
@@ -251,9 +257,11 @@ Submit outbound email draft for owner review.
 
 ### restart_session
 
-Restart the daemon with an update.
+Restart the daemon cleanly with an update.
 
 **Parameters:**
 - `post_command` (string, optional) — Command to inject after startup. Falls back to `B3_LAUNCH_CMD` env var.
 
-**Warning:** Kills the current session. User must wait ~10-15 seconds. Restart log saved to `/tmp/b3-restart-{timestamp}.log`.
+**Behavior:** Performs `b3 update` (downloads latest binary), then restarts the daemon. Restart log saved to `/tmp/b3-restart-{timestamp}.log`. The session resumes automatically — no manual intervention needed.
+
+**Warning:** Kills the current Claude Code session. User must wait ~10-15 seconds for restart.

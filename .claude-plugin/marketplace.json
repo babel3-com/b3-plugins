@@ -1,12 +1,13 @@
 {
-  "name": "Babel3 Plugin Marketplace",
-  "description": "Curated plugins for Claude Code, reviewed for quality and accuracy.",
-  "version": "1.0.0",
+  "name": "b3-plugins",
+  "owner": {
+    "name": "Babel3"
+  },
   "plugins": [
     {
       "name": "b3",
-      "path": "plugins/b3",
-      "description": "Voice I/O, inter-agent messaging, browser control, and codebase guide for Babel3.",
+      "source": "./plugins/b3",
+      "description": "Give your Claude Code session a voice, a presence, and a way to talk to other agents. Provides the B3 MCP server (voice, hive, browser, system) plus a codebase skill.",
       "version": "0.1.0"
     }
   ]
