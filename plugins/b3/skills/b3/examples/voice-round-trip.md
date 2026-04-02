@@ -1,61 +1,81 @@
-# Example: Voice Round-Trip
+<!-- verified-against: b3-cli@0.1.1409, b3-reliable@0.1.0 -->
 
-What happens when a user says "Hello" and Claude responds with speech.
+# Example: Voice Round-Trip (Dual Transport + Reliability Layer)
 
-## The Flow (WebRTC — Primary Path)
+What happens when a user says "Hello" and Claude responds with speech. Shows both transport paths and the reliability layer that wraps them.
+
+## The Flow
 
 ```
-1. Browser captures audio (browser/js/voice-record.js)
-   └── WebRTC data channel → b3-gpu-rtc sidecar (port 5126)
+1. CAPTURE — Browser captures audio (voice-record.js)
+   └── Audio available for transcription
 
-2. Sidecar bridges to GPU worker (b3-gpu-rtc → local_server.py)
-   └── HTTP POST /run or WS stream_start → handler.py
-   └── GPU worker: faster-whisper + WhisperX → transcription
+2. STT — Audio sent to GPU for transcription
+   ├── Primary: WebRTC data channel → b3-gpu-relay sidecar (port 5126)
+   │   └── Sidecar wraps with b3-reliable, bridges to local_server.py
+   └── Fallback: HTTP POST to GPU worker (local 2s timeout → RunPod)
+   └── GPU: faster-whisper + WhisperX → transcription + garbage filter
 
-3. Sidecar returns result over data channel → browser
-   └── Browser injects transcription into daemon via control channel
-
-4. Daemon injects transcription into PTY (daemon/rtc.rs → PTY stdin)
+3. INJECT — Transcription injected into daemon PTY
+   ├── Primary: WebRTC control channel → daemon/rtc.rs → PTY stdin
+   └── Fallback: WebSocket → daemon/web.rs → PTY stdin
    └── Claude sees: [MIC] yaniv: Hello
 
-5. Claude calls voice_say() MCP tool (mcp/voice.rs)
-   └── MCP → daemon web server → TtsStream event → browser
+4. RESPOND — Claude calls voice_say() MCP tool (mcp/voice.rs)
+   └── MCP → daemon web server → TtsStream event
 
-6. Browser dispatches TTS to GPU (browser/js/gpu.js)
-   ├── WebRTC data channel → b3-gpu-rtc → local_server.py
+5. DELIVER — TtsStream event reaches browser
+   ├── ReliableChannel wraps event (seq + CRC32 + Critical priority)
+   ├── MultiTransport routes to best sink:
+   │   ├── WebRTC data channel (priority 0, preferred) → browser
+   │   └── WebSocket via CF tunnel (priority 1, fallback) → browser
+   └── Browser ACKs received frames (every 100ms)
+
+6. TTS — Browser dispatches to GPU (gpu.js)
    ├── Text chunked at sentence boundaries
    ├── Each chunk → GPU worker (Chatterbox TTS)
-   └── Audio streamed back over data channel as chunks complete
+   └── Audio streamed back as chunks complete
 
-7. Browser plays audio (browser/js/voice-play.js)
-   └── LED chromatophore animates based on emotion (browser/js/led.js)
+7. PLAY — Browser plays audio (voice-play.js)
+   ├── GaplessStreamPlayer (Web Audio API, zero-gap)
+   ├── iOS Chrome: HTML <audio> fallback
+   └── LED chromatophore animates based on emotion (led.js)
 ```
 
-## The Flow (Cloudflare Tunnel — Fallback)
+## Reliability Layer in Action
+
+The reliability layer wraps steps 5-7 (daemon → browser delivery):
 
 ```
-1. Browser captures audio (browser/js/voice-record.js)
-   └── POST /api/agents/{id}/audio-upload → daemon via Cloudflare tunnel
-
-2. Daemon receives audio, dispatches to GPU (daemon/web.rs)
-   └── GPU worker: faster-whisper + WhisperX → transcription
-
-3. Daemon injects transcription into PTY (bridge/puller.rs)
-   └── Claude sees: [MIC] yaniv: Hello
-
-4. Claude calls voice_say() MCP tool (mcp/voice.rs)
-   └── MCP → daemon web server → TtsStream event → browser via WebSocket
-
-5. Browser dispatches TTS to GPU (browser/js/gpu.js)
-   ├── HTTP POST to GPU worker (local or RunPod)
-   ├── Polls /stream/{jobId} for audio chunks
-   └── Audio arrives as chunks complete
-
-6. Browser plays audio (browser/js/voice-play.js)
-   └── LED chromatophore animates based on emotion
+Daemon                              Browser
+┌─────────────┐                    ┌─────────────┐
+│ voice_say() │                    │ reliable.js  │
+│      │      │                    │      │       │
+│      ▼      │                    │      ▼       │
+│ ReliableChannel                  │ ReliableChannel
+│  seq=4217   │    0xB3 frame      │  ACK 4217    │
+│  CRC32      │ ──────────────►    │  deliver     │
+│  Critical   │                    │      │       │
+│             │    ACK frame       │      ▼       │
+│  evict 4217 │ ◄──────────────    │ TTS dispatch │
+└─────────────┘                    └─────────────┘
 ```
 
-## Timeline (WebRTC)
+**If the transport drops mid-delivery:**
+
+```
+Daemon sends seq 4217, 4218, 4219 over WebRTC
+WebRTC dies at seq 4218 (cellular handoff)
+  │
+  ├── MultiTransport detects dead sink (15s heartbeat timeout)
+  ├── Removes WebRTC, routes to WebSocket automatically
+  ├── Browser reconnects WebRTC moments later
+  ├── Browser sends Resume(last_ack=4217)
+  ├── Daemon replays seq 4218, 4219 (Critical) over new WebRTC
+  └── Browser receives, plays audio — no data lost
+```
+
+## Timeline (WebRTC Path)
 
 ```
 0.0s    User says "Hello"
@@ -64,8 +84,11 @@ What happens when a user says "Hello" and Claude responds with speech.
 1.5s    GPU returns transcription (peer-to-peer, no server hop)
 1.6s    "[MIC] yaniv: Hello" injected into PTY
 2.2s    Claude calls voice_say()
-3.0s    First sentence audio arrives at browser over data channel
+2.3s    TtsStream wrapped by ReliableChannel (seq, CRC32, Critical)
+2.4s    MultiTransport routes via WebRTC (priority 0)
+3.0s    First sentence audio arrives at browser
 3.1s    Browser plays: "Hey! I can hear you."
+3.2s    Browser ACKs → daemon evicts from send buffer
 ```
 
 ## Streaming STT (Long Recordings)
@@ -102,13 +125,22 @@ voice_say() called
     │
     ▼
 Daemon sends TtsStream event to browser
-    │
+    │ (wrapped by ReliableChannel, routed by MultiTransport)
     ▼
 Browser checks GPU WebRTC connection
-    ├── Connected? → Send over data channel to sidecar
-    │                 (sidecar bridges to local_server.py)
+    ├── Connected? → Send over data channel to b3-gpu-relay
+    │                 (relay wraps with b3-reliable per-session)
     └── Not connected? → HTTP POST to GPU worker
                           (local 2s timeout → RunPod fallback)
 ```
 
-**Key:** Audio never routes through the EC2 server. All voice traffic is peer-to-peer: browser ↔ daemon (via WebRTC or tunnel) and browser ↔ GPU (via WebRTC sidecar or direct HTTP).
+**Key:** Audio never routes through the EC2 server. All voice traffic is peer-to-peer: browser ↔ daemon (via WebRTC or CF tunnel) and browser ↔ GPU (via WebRTC sidecar or direct HTTP). The EC2 server is only a signaling relay for WebRTC offers/answers/ICE candidates.
+
+## Transport Priority
+
+| Transport | Priority | Latency | Reliability |
+|-----------|----------|---------|-------------|
+| WebRTC data channel | 0 (preferred) | Low (P2P) | b3-reliable wraps |
+| WebSocket via CF tunnel | 1 (fallback) | Medium (proxy hop) | b3-reliable wraps |
+
+Both are wrapped by the same `ReliableChannel` with continuous sequence numbers. A frame sent as seq 100 over WebRTC and replayed as seq 100 over WebSocket after reconnect is deduplicated by the browser.

@@ -1,5 +1,4 @@
-<!-- verified-against: b3-cli@0.1.1014 -->
-<!-- Patent notice: Multi-model transcription injection via bridge puller (US 64/010,891). Licensed under Apache 2.0 with royalty-free patent grant. See PATENTS. -->
+<!-- verified-against: b3-cli@0.1.1409 -->
 
 # Daemon Architecture Reference
 
@@ -30,27 +29,33 @@ src/
 │   ├── uninstall.rs     # b3 uninstall — remove installation
 │   └── version.rs       # b3 version
 ├── daemon/
-│   ├── server.rs        # Daemon orchestrator — PTY, tunnel, bridge, IPC
-│   ├── web.rs           # Local web server, voice job reporting
-│   ├── rtc.rs           # WebRTC peer connections, ICE, PeerRegistry
-│   ├── gpu_client.rs    # GPU TTS client (local-first + RunPod fallback)
+│   ├── server.rs        # Daemon orchestrator — PTY, tunnel, bridge, SessionManager
+│   ├── web.rs           # Axum web server, SessionStore (Arc<Vec<u8>>), routes
+│   ├── rtc.rs           # WebRTC peer connections, ICE, PeerRegistry, data channels
+│   ├── gpu_client.rs    # GPU TTS client (local-first + RunPod fallback, 2s timeout)
 │   ├── info_archive.rs  # Persistent info panel storage (max 1000 entries)
 │   ├── tts_archive.rs   # TTS message archive for offline replay (max 50)
-│   ├── protocol.rs      # IPC message protocol
+│   ├── protocol.rs      # IPC message protocol (length-prefixed)
 │   └── ipc.rs           # Unix socket IPC listener/client
 ├── bridge/
-│   ├── pusher.rs        # Terminal output → server (POST /api/session-push)
-│   ├── puller.rs        # Server events → PTY input (SSE /events)
-│   ├── parser.rs        # PTY output parsing
+│   ├── puller.rs        # Server events → PTY input (SSE), hive dedup, RTC signaling relay
 │   └── mod.rs
 ├── pty/
-│   ├── manager.rs       # PTY spawn, read, write, resize
+│   ├── manager.rs       # PTY spawn, read, write, resize, broadcast
 │   ├── attach.rs        # Client attachment to running PTY
 │   └── mod.rs
-└── mcp/
-    ├── voice.rs         # MCP server — 19 tools for Claude Code
-    ├── manager.rs       # Dynamic MCP server loading/unloading
-    ├── registry.rs      # MCP server registry
+├── mcp/
+│   ├── voice.rs         # MCP server — 19 tools for Claude Code
+│   ├── manager.rs       # Dynamic MCP server loading/unloading
+│   ├── registry.rs      # Plugin registry
+│   └── mod.rs
+├── crypto/
+│   ├── hive.rs          # X25519 ECDH, HKDF, ChaCha20-Poly1305 AEAD
+│   ├── hive_integration.rs  # TOFU pinning, room key storage, encrypt/decrypt
+│   └── mod.rs
+└── mesh/
+    ├── config.rs        # WireGuard config generation
+    ├── tunnel.rs        # Userspace tunnel, TCP proxy 127.0.0.1:13000
     └── mod.rs
 ```
 
@@ -61,31 +66,44 @@ src/
 ```
 crates/
 ├── b3-common/           # Shared types: AgentEvent (~20 variants), SessionPush
+├── b3-reliable/         # Mosh-like reliability layer
+│   ├── frame.rs         # Wire format (0xB3 magic, Data/ACK/Resume)
+│   ├── channel.rs       # ReliableChannel (seq, CRC32, send buffer, retransmit)
+│   ├── multi.rs         # MultiTransport (priority routing, failover)
+│   ├── session.rs       # Session + SessionManager (per-browser isolation)
+│   └── bridge.rs        # backend_to_browser() async task
 ├── b3-webrtc/           # WebRTC abstraction over datachannel-rs
-│   ├── channel.rs       # Binary framing protocol + 16KB chunking
-│   ├── peer.rs          # B3Peer wrapper, PeerEvent, PeerConfig
-│   └── signaling.rs     # SDP/ICE types, TURN credential generation
-└── b3-gpu-rtc/          # GPU WebRTC sidecar (separate binary)
+│   ├── lib.rs           # init_safe_logging() (TLS panic fix)
+│   ├── channel.rs       # Framed protocol, 16KB chunking, ChunkAssembler
+│   ├── peer.rs          # B3Peer, PeerEvent, data channel management
+│   └── signaling.rs     # SDP/ICE types, TURN credentials (RFC 7635)
+└── b3-gpu-relay/        # GPU WebRTC sidecar (reliability relay, port 5126)
 ```
 
 ---
 
 ## Daemon Startup Sequence (server.rs)
 
-The daemon orchestrates startup in numbered steps:
-
 1. **Rotate logs** — Rename `daemon.log` → `daemon.log.prev` (crash evidence preservation)
-2. **Load config** — Read `~/.b3/config.json`, resolve agent identity
-3. **Register with server** — `POST /api/agents/register` with API key
-4. **Register MCP** — Add `b3` entry to `.mcp.json` (non-destructive merge, skipped if plugin installed)
-5. **Start primary Cloudflare tunnel** — Spawn `cloudflared` for home domain
-   - 5d. **Restore dynamic tunnels** — Query `GET /api/agents/:id/tunnels`, spawn `cloudflared` for each
-6. **Start PTY** — Spawn Claude Code in pseudo-terminal
-7. **Start bridge** — Launch pusher (terminal → server) and puller (server → PTY)
-   - Create PeerRegistry for WebRTC sessions
-   - Create LazyWebState for deferred web server initialization
-8. **Start web server** — Agent-specific port for dashboard, voice, hive, file browser
-9. **Start IPC listener** — Unix socket for `b3 attach`, `b3 stop`, etc.
+2. **Clean up stale IPC** — Remove old Unix socket endpoint
+3. **Write PID file** — For process management
+4. **Stamp version** — Write b3 version to config (enables upgrade detection)
+5. **Start WireGuard tunnel** — Userspace tunnel, write proxy port to `~/.b3/mesh-proxy.port`
+6. **Verify API reachable** — Direct HTTPS to babel3.com (5 retries, 1s delay)
+7. **Auto-provision tunnel token** — POST `/api/agents/{id}/provision-tunnel` if missing
+8. **Register MCP** — Check if B3 plugin installed (reads `~/.claude/plugins/installed_plugins.json`). If plugin found: skip. Else: write `b3` entry to `.mcp.json` (non-destructive, backup original)
+9. **Spawn PTY** — Claude Code in pseudo-terminal
+10. **Start puller** — SSE events from EC2, hive dedup, RTC signaling relay
+    - Spawn hive polling fallback (every 30s safety net)
+11. **Create WebState with SessionManager** — SessionStore, EventChannel, PeerRegistry, TtsArchive, InfoArchive, GpuClient, SessionManager
+12. **Populate lazy_web_state** — For puller access to web state
+13. **Spawn local_pusher** — PTY output → SessionStore (zero network hop, replaces HTTP delta pushes)
+14. **Spawn local_puller** — WebSocket keystrokes → PTY stdin
+15. **Start web server** — Axum routes: dashboard, API, WebSocket
+16. **Start IPC listener** — Unix socket for attach/detach/stop
+17. **On attach** — Forward PTY output to client
+18. **On detach** — PTY keeps running
+19. **On stop** — Kill PTY, close tunnel, clean up
 
 ---
 
@@ -99,7 +117,7 @@ Handles peer-to-peer data channels between browser and daemon.
 - `"audio"` (ordered, reliable) — TTS WAV chunks
 
 **Key types:**
-- `PeerRegistry` — `Arc<Mutex<HashMap<String, mpsc::Sender<IceCandidate>>>>` — maps session_id to ICE injection channel. Bridge owns the peer exclusively; ICE candidates arrive via mpsc channel (prevents deadlock).
+- `PeerRegistry` — Maps session_id to `PeerEntry` (ICE sender channel + task handle + browser_session_id). On new offer from same browser: abort old peer, create new one.
 - `IceCandidate` — candidate string + mid
 
 **Functions:**
@@ -115,13 +133,27 @@ Handles peer-to-peer data channels between browser and daemon.
 
 ---
 
+## SessionManager Integration (daemon/web.rs)
+
+**WebState** holds `session_manager: Arc<SessionManager>` for per-browser isolation.
+
+**Per-session state:**
+- Own `MultiTransport` (seq counter, send buffer, priority routing)
+- Own `sent_offset` (per-client delta tracking into SessionStore)
+- Own `rtc_active` flag
+- Own bridge task (backend → browser via MultiTransport)
+
+**On WebSocket connect:** `reconnect_or_create(client_id)` — reuses existing session or creates new one, preserving send buffer on reconnect.
+
+**On WebRTC offer:** Links to session via `browser_session_id`, adds RTC as transport sink (priority 0).
+
+**SessionStore** uses `Arc<Vec<u8>>` — raw bytes, no base64 encoding churn. Base64 only on wire for HTTP delta pushes.
+
+---
+
 ## GPU Client (daemon/gpu_client.rs)
 
 Submits TTS jobs to GPU workers with local-first routing.
-
-**Key types:**
-- `GpuClient` — conditionals cache (`RwLock<HashMap<String, CachedConditional>>`), HTTP client
-- `GpuConfig` — reads from env vars: `LOCAL_GPU_URL`, `LOCAL_GPU_TOKEN`, `RUNPOD_GPU_ID`, `RUNPOD_API_KEY`
 
 **Routing:**
 1. POST `/run` to local GPU (2s timeout)
@@ -134,18 +166,7 @@ Submits TTS jobs to GPU workers with local-first routing.
 
 ---
 
-## Bridge: Pusher and Puller
-
-### Pusher (pusher.rs)
-
-Sends terminal output to the server for persistence:
-
-```
-PTY stdout → broadcast channel → pusher accumulates → base64 encode
-  → POST /api/session-push every 100ms
-```
-
-### Puller (puller.rs)
+## Bridge: Puller (bridge/puller.rs)
 
 Receives server events and injects into the PTY:
 
@@ -155,7 +176,7 @@ SSE /api/agents/{id}/events → parse AgentEvent → format → write to PTY std
 
 **Key types:**
 - `LazyWebState` — `Arc<RwLock<Option<WebState>>>` — deferred initialization, set after web server starts
-- `HiveDedup` — 200-entry ring buffer for deduplicating hive messages
+- `HiveDedup` — 200-entry ring buffer for deduplicating hive messages (fingerprint-based: sender + message prefix)
 
 **Event types handled:**
 - `input` — Keystroke injection
@@ -166,33 +187,33 @@ SSE /api/agents/{id}/events → parse AgentEvent → format → write to PTY std
 - `browser_eval` — Execute JS in browser, return result
 - `config_update` — Runtime config changes
 - `resize` — Terminal resize
-- `webrtc_offer` — WebRTC SDP offer from browser (relayed via EC2). Routes to daemon's `rtc::handle_offer` or forwards to GPU sidecar based on `target` field.
+- `webrtc_offer` — SDP offer from browser (relayed via EC2). Routes to daemon's `rtc::handle_offer` or forwards to GPU sidecar based on `target` field
 - `webrtc_answer` — SDP answer delivery (with `origin_url` for cross-server routing)
 - `webrtc_ice` — Trickle ICE candidate → forwarded to PeerRegistry via mpsc channel
 
 **Resilience:**
-- Auto-reconnect on SSE disconnect (1s backoff)
+- Auto-reconnect on SSE disconnect (1s–30s exponential backoff)
 - Safety net: `HIVE_POLL_INTERVAL = 30s` polls for missed SSE events
-- Max permanent failures: 10 (e.g., 401/403 auth failures)
+- Max permanent failures: 10 consecutive auth errors (401/403)
 
 ---
 
 ## Web Server (daemon/web.rs)
 
-Local HTTP server on agent-specific port. Exposed to browser via Cloudflare tunnel or WebRTC.
+Local Axum server on agent-specific port.
 
 **Key routes:**
-- WebSocket terminal relay (peer-to-peer terminal)
+- WebSocket terminal relay (`/api/ws`)
 - Voice: audio upload → STT, TTS synthesis, audio delivery
 - Hive: message sending/receiving (proxied to EC2)
 - File browser: directory listing, file reading, PDF serving
+- Browser console + eval endpoints
 - Health and status endpoints
-- Voice job reporting: register + checkpoint to EC2 ledger (fire-and-forget)
 
 **Key types:**
-- `WebState` — shared web server state
-- `SessionStore` — in-memory session data
-- `EventChannel` — broadcast channel for browser events
+- `WebState` — Shared web server state (SessionManager, PeerRegistry, EventChannel, GpuClient, archives)
+- `SessionStore` — `Arc<Vec<u8>>` ring buffer of raw PTY output bytes
+- `EventChannel` — Broadcast channel for browser events
 
 ---
 
@@ -204,17 +225,27 @@ Spawned by Claude Code as `b3 mcp voice`. Communicates over stdio using MCP JSON
 
 **Authentication:** Reads API key from `~/.b3/config.json` for daemon web server auth.
 
-**Tool dispatch:** Each tool call routes to the daemon's web server at `localhost:{port}`. The MCP server is a thin translation layer between MCP JSON-RPC and the daemon's HTTP API.
+**19 tools:** voice_say, voice_status, voice_health, voice_logs, voice_share_info, voice_enroll_speakers, animation_add, email_draft, browser_console, browser_eval, hive_send, hive_status, hive_converse, hive_conversation, hive_conversation_start, hive_conversation_destroy_key, hive_conversation_rooms, hive_messages, restart_session.
+
+---
+
+## Hive Encryption (crypto/)
+
+**DM encryption:** X25519 ECDH key agreement → HKDF key derivation → ChaCha20-Poly1305 AEAD. AAD is `sender:target` pair. TOFU public key pinning cached in `~/.b3/pinned-keys/`.
+
+**Conversation rooms:** Room key stored at `~/.b3/room-keys/{room_id}.b64` (0o600 perms). Mandatory expiration on creation. Any member can destroy the key (irreversible).
+
+**v1 limitations:** Per-message key fetch (TOFU cache mitigates), no replay window for DMs, room keys plaintext on disk.
 
 ---
 
 ## Configuration
 
-Agent config lives in `~/.b3/`:
-
 ```
 ~/.b3/
-├── config.json          # Agent identity, API key, server URL
+├── config.json          # Agent identity, API key, server URL, tunnel token
+├── pinned-keys/         # TOFU public key cache
+├── room-keys/           # Conversation room encryption keys
 ├── bin/
 │   └── cloudflared      # Cloudflare tunnel binary
 └── agents/
@@ -226,9 +257,7 @@ Agent config lives in `~/.b3/`:
 
 ## Key Data Types (b3-common)
 
-### AgentEvent
-
-The central event type flowing between server and daemon (~20 variants):
+### AgentEvent (~20 variants)
 
 ```rust
 enum AgentEvent {
@@ -254,21 +283,3 @@ enum AgentEvent {
     // ... additional variants
 }
 ```
-
-### WebRTC Framing Protocol (b3-webrtc/channel.rs)
-
-Wire format for all data channel messages:
-
-```
-[type: u8][length: u32 LE][payload]
-```
-
-| Type | Value | Description |
-|------|-------|-------------|
-| JSON | 0x01 | Text messages (control, RPC, events) |
-| Binary | 0x02 | Audio chunks, PTY bytes |
-| Ping | 0x03 | Keepalive |
-| Pong | 0x04 | Keepalive response |
-| Chunk | 0x05 | Fragment of message > 16KB |
-
-**Chunking:** Messages over 16KB are split into chunks (Firefox SCTP fragmentation workaround). Chunk header: `[seq: u32][total: u32][original_type: u8]`. Max chunk payload: `16384 - 5 - 9 = 16370 bytes`.
