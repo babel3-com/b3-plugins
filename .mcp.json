@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "b3": {
+      "command": "b3",
+      "args": ["mcp", "voice"]
+    },
+    "session-memory": {
+      "command": "b3",
+      "args": ["mcp", "session-memory"]
+    }
+  }
+}
